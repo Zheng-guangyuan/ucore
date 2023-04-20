@@ -225,7 +225,7 @@ qemu-nox: $(UCOREIMG)
 	$(V)$(QEMU)   -no-reboot -serial mon:stdio -hda $< -nographic
 TERMINAL        :=gnome-terminal
 debug: $(UCOREIMG)
-	$(V)$(QEMU) -S -s -parallel stdio -hda $< -serial null &
+	$(V)$(QEMU) -S -s -d in_asm -D $(BINDIR)/qemu.log -parallel stdio -hda $< -serial null &
 	$(V)sleep 2
 	$(V)$(TERMINAL) -e "gdb -q -tui -x tools/gdbinit"
 	
