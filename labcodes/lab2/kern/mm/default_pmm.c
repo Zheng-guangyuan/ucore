@@ -72,13 +72,14 @@ default_init_memmap(struct Page *base, size_t n) {
     for (; p != base + n; p ++) {
         assert(PageReserved(p));
         p->flags = p->property = 0;
-        set_page_ref(p, 0);
+        set_page_ref(p, 0); 
     }
     base->property = n;
     SetPageProperty(base);
     nr_free += n;
     list_add(&free_list, &(base->page_link));
 }
+
 
 static struct Page *
 default_alloc_pages(size_t n) {
@@ -87,21 +88,24 @@ default_alloc_pages(size_t n) {
         return NULL;
     }
     struct Page *page = NULL;
-    list_entry_t *le = &free_list;
-    while ((le = list_next(le)) != &free_list) {
+    list_entry_t *le = list_next(&free_list);
+    while (le != &free_list) {
         struct Page *p = le2page(le, page_link);
         if (p->property >= n) {
             page = p;
             break;
         }
+        le = list_next(le);
     }
     if (page != NULL) {
-        list_del(&(page->page_link));
         if (page->property > n) {
             struct Page *p = page + n;
             p->property = page->property - n;
-            list_add(&free_list, &(p->page_link));
-    }
+            //p->flags = 0;
+            SetPageProperty(p);
+            list_add(&(page->page_link), &(p->page_link));
+        }
+        list_del(&(page->page_link));
         nr_free -= n;
         ClearPageProperty(page);
     }
@@ -112,12 +116,12 @@ static void
 default_free_pages(struct Page *base, size_t n) {
     assert(n > 0);
     struct Page *p = base;
-    for (; p != base + n; p ++) {
+    for (; p != base + n; p ++) { 
         assert(!PageReserved(p) && !PageProperty(p));
         p->flags = 0;
         set_page_ref(p, 0);
     }
-    base->property = n;
+    base->property = n; //头页property设为n
     SetPageProperty(base);
     list_entry_t *le = list_next(&free_list);
     while (le != &free_list) {
@@ -136,7 +140,16 @@ default_free_pages(struct Page *base, size_t n) {
         }
     }
     nr_free += n;
-    list_add(&free_list, &(base->page_link));
+    le = list_next(&free_list);
+    while (le != &free_list) {
+        p = le2page(le, page_link);  //将空闲列表条目转换为页面
+        if (base + base->property <= p) { //地址大小由空闲块大小来表示
+            assert(base + base->property != p);
+            break;
+        }
+        le = list_next(le);
+    }
+    list_add_before(le, &(base->page_link)); //将合并后的空闲块添加会空闲列表
 }
 
 static size_t

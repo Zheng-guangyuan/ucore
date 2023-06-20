@@ -44,6 +44,10 @@ SECTIONS {
         *(.data)
     }
 
+    .data.pgdir : {
+        *(.data.pgdir)
+    }
+
     PROVIDE(edata = .);
 
     .bss : {

@@ -291,19 +291,31 @@ read_eip(void) {
  * Note that, the length of ebp-chain is limited. In boot/bootasm.S, before jumping
  * to the kernel entry, the value of ebp has been set to zero, that's the boundary.
  * */
-void
-print_stackframe(void) {
-     /* LAB1 YOUR CODE : STEP 1 */
-     /* (1) call read_ebp() to get the value of ebp. the type is (uint32_t);
-      * (2) call read_eip() to get the value of eip. the type is (uint32_t);
-      * (3) from 0 .. STACKFRAME_DEPTH
-      *    (3.1) printf value of ebp, eip
-      *    (3.2) (uint32_t)calling arguments [0..4] = the contents in address (unit32_t)ebp +2 [0..4]
-      *    (3.3) cprintf("\n");
-      *    (3.4) call print_debuginfo(eip-1) to print the C calling function name and line number, etc.
-      *    (3.5) popup a calling stackframe
-      *           NOTICE: the calling funciton's return addr eip  = ss:[ebp+4]
-      *                   the calling funciton's ebp = ss:[ebp]
-      */
+
+void print_stackframe(void) {
+    // call read_ebp() to get the value of ebp. the type is (uint32_t);
+    uint32_t ebp = read_ebp();	
+    // call read_eip() to get the value of eip. the type is (uint32_t);
+    uint32_t eip = read_eip();	
+    int i, j;
+    for(i=0; i < STACKFRAME_DEPTH && ebp!=0; i++) {
+        cprintf("ebp:0x%08x ",ebp);		// printf value of ebp
+        cprintf("eip:0x%08x ",eip);		// printf value of eip
+        // (uint32_t)calling arguments [0..4] = the contents in address (uint32_t)ebp +2 [0..4]
+        uint32_t* args = (uint32_t*)ebp + 2;
+        cprintf("args:");				
+        for(j=0; j<4; j++){
+            cprintf("0x%08x ",args[j]);
+        }     
+        cprintf("\n");					// cprintf("\n");
+        // print the C calling function name and line number
+        print_debuginfo(eip-1);			
+ 
+       	// popup a calling stackframe
+        eip = ((uint32_t*)ebp)[1];		
+        // the calling funciton's return addr eip = ss:[ebp+4]
+        ebp = ((uint32_t*)ebp)[0];  
+        // the calling funciton's ebp = ss:[ebp]
+    }
 }
 

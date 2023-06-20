@@ -30,7 +30,7 @@
 产生上述情况说明**文件已经进行过编译且编译后没有文件更新**，只需在终端执行指令`$ make clean`后，再执行`$ make`即可。正确结果如下图所示
 ![](make_1.jpg)
 
-### Lab 1 练习 1: 理解通过 make 生成执行文件的过程
+### 练习 1: 理解通过 make 生成执行文件的过程
 
 #### 前置知识：makefile基本知识
 
@@ -381,7 +381,7 @@ main(int argc, char *argv[]) {
 
 事实上，主引导扇区的前510字节的内容规划也是有规定的：446个字节为主引导程序（bootloader），接下来64个字节为分区表，用于描述硬盘的分区信息
 
-### Lab 1 练习 2：使用qemu执行并调试lab1中的软件
+### 练习 2：使用qemu执行并调试lab1中的软件
 
 * 前置知识：gdb与qemu的配合使用，参考ucore实验指导书与其他资料
 
@@ -451,11 +451,341 @@ IN:
 
 * 对于练习2中自定义断点进行测试不作详细展示
 
-### Lab1-练习 3：分析bootloader进入保护模式的过程
+### 练习 3：分析bootloader进入保护模式的过程
 
-#### 保护模式与实模式
+#### 基本知识概述
 
-* 阅读实验指导书的相关章节，对保护模式与实模式进行总结
+* 对所需知识进行简要总结
 
-在引导程序接手BIOS的工作时，PC系统处于**实模式**，在这种状态下软件可访问的物理内存空间不能超过1MB，并且操作系统和用户程序并没有区别对待，每一个指针都是指向实际的物理地址。因此用户可能无意中修改了其他用户的数据甚至是操作系统的重要数据，这是及其危险的。而在保护模式下，80386的全部32根地址线有效，可寻址高达4G字节的线性地址空间和物理地址空间，可访问64TB（有2^14^个段，每个段最大空间为2^32^字节）的逻辑地址空间
+##### 保护模式与实模式
 
+在引导程序接手BIOS的工作时，PC系统处于**实模式**，在这种状态下软件可访问的物理内存空间不能超过1MB，并且操作系统和用户程序并没有区别对待，每一个指针都是指向实际的物理地址。因此用户可能无意中修改了其他用户的数据甚至是操作系统的重要数据，这是及其危险的。在**保护模式**下，80386的全部32根地址线有效，可寻址高达4G字节的线性地址空间和物理地址空间，更重要的，保护模式下，系统可以采取**分段管理机制**。
+
+分段管理机制涉及到几个重要概念：逻辑地址、段描述符（描述段的属性）、段描述符表（管理多个段描述符）、段选择子（段寄存器，用于定位描述符表中某一项索引）。首先，**段描述符**用于描述段的属性，包括段的基址，段的界限以及段的其他属性；**段描述符表**用于存储段描述符，实际上是一个包含段描述符的数组；**段选择子**则可以定位段描述符在段描述符表中的索引，从而访问对应的段；最后，**逻辑地址**包括段选择子与段偏移地址。
+
+可以通过逻辑地址访问实际物理地址，首先通过段选择子找到对应段的基址，然后将基址处理后加上偏移量，即可得到实际地址
+
+需要注意，分段管理机制只有在保护模式中启用，另一方面来说，在切换为保护模式时，必须建立好段描述符表，才能保证分段管理机制正确运作
+
+> 注：实际上，逻辑地址通过上述变换得到的是**线性地址**，也称为虚拟地址，在没有启用分页管理机制时，线性地址与实际地址的值相同，但在启用分页管理机制后，线性地址要通过分页转换，才能得到相应的实际地址。
+
+##### A20 Gate
+
+A20门是IBM PC兼容机上一个控制地址总线的电路。在早期的PC中，由于历史原因，CPU只使用了20根地址线，导致最大只能寻址1MB的内存空间。后来的PC机为了向下兼容，中增加了A20门电路，用于控制CPU能够访问的物理内存范围。当A20门关闭时，CPU只能寻址1MB的内存空间，而当A20门打开时，CPU可以访问1MB以上的内存空间。在保护模式下，操作系统需要控制A20门的状态，以确保程序只能访问被授权的内存空间，而不会越界访问其他内存区域。
+
+#### bootasm.S代码解析
+
+在代码开头的注释内容中，我们得知：BIOS将该代码从硬盘的第一个扇区（主引导扇区）加载到物理地址为0x7c00的内存中，并开始以实模式在`cs=0 ip=7c00`执行。
+
+下面结合注释，对代码进行分析
+
+* 首先设置内核代码段选择子、内核数据段选择子以及保护模式使能标志
+
+```assembly
+.set PROT_MODE_CSEG,        0x8                     # kernel code segment selector
+.set PROT_MODE_DSEG,        0x10                    # kernel data segment selector
+.set CR0_PE_ON,             0x1                     # protected mode enable flag
+```
+
+* 进入程序后，清理环境，将段寄存器与flag均置为0
+
+```assembly
+.code16                                             # Assemble for 16-bit mode
+    cli                                             # Disable interrupts
+    cld                                             # String operations increment
+    # Set up the important data segment registers (DS, ES, SS).
+    xorw %ax, %ax                                   # Segment number zero
+    movw %ax, %ds                                   # -> Data Segment
+    movw %ax, %es                                   # -> Extra Segment
+    movw %ax, %ss                                   # -> Stack Segment
+```
+
+* 打开**A20 Gate**，禁止寻址方向回卷，允许访问超过1MB的内存空间。由于A20的地址位是由芯片8042管理，这个芯片与键盘控制器有关，因此通过给8042芯片发命令来激活A20的地址位，8042的两个I/O端口是0x64和0x60，通过发送0xd1命令到0x64端口、发送0xdf到0x60端口就可以激活。下方代码分为两个部分，需要注意的是，这两部分代码都要通过读0x64端口的第2位，确保8042的输入缓冲区为空后再进行操作
+
+```assembly
+seta20.1:
+    inb $0x64, %al                                  # Wait for not busy(8042 input buffer empty).
+    testb $0x2, %al                                 # 如果 %al 第低2位为1，则ZF = 0, 则跳转
+    jnz seta20.1                                    # 如果 %al 第低2位为0，则ZF = 1, 则不跳转
+
+    movb $0xd1, %al                                 # 0xd1 -> port 0x64
+    outb %al, $0x64                                 # 0xd1 means: write data to 8042's P2 port
+
+seta20.2:
+    inb $0x64, %al                                  # Wait for not busy(8042 input buffer empty).
+    testb $0x2, %al
+    jnz seta20.2
+
+    movb $0xdf, %al                                 # 0xdf -> port 0x60
+    outb %al, $0x60                                 # 0xdf = 11011111, means set P2's A20 bit(the 1 bit) to 1
+```
+
+* 初始化**GDT**(全局段描述符表)。在代码末尾部分，为GDT分配了内存，通过执行`lgdt`将一个已经静态储存在引导区中的简单的GDT表及其描述符载入到内存
+
+```assembly
+	lgdt gdtdesc
+	
+	# Bootstrap GDT
+.p2align 2                                          # force 4 byte alignment
+gdt:
+    SEG_NULLASM                                     # null seg
+    SEG_ASM(STA_X|STA_R, 0x0, 0xffffffff)           # code seg for bootloader and kernel
+    SEG_ASM(STA_W, 0x0, 0xffffffff)                 # data seg for bootloader and kernel
+
+gdtdesc:
+    .word 0x17                                      # sizeof(gdt) - 1
+    .long gdt                                       # address gdt
+```
+
+* 通过将**cr0寄存器**的PE位置为1,开启保护模式
+```assembly
+	movl %cr0, %eax
+	orl $CR0_PE_ON, %eax
+	movl %eax, %cr0
+```
+
+* 通过长跳转更新cs的基地址，跳转位置在下一段代码
+```assembly
+ljmp $PROT_MODE_CSEG, $protcseg
+```
+
+* 进入32位代码模式，设置段寄存器，并建立堆栈（分段管理机制）
+```assembly
+.code32                                             # Assemble for 32-bit mode
+protcseg:
+    # Set up the protected-mode data segment registers
+    movw $PROT_MODE_DSEG, %ax                       # Our data segment selector
+    movw %ax, %ds                                   # -> DS: Data Segment
+    movw %ax, %es                                   # -> ES: Extra Segment
+    movw %ax, %fs                                   # -> FS
+    movw %ax, %gs                                   # -> GS
+    movw %ax, %ss                                   # -> SS: Stack Segment
+```
+
+* 成功切换至保护模式，进入boot主方法
+```assembly
+	call bootmain
+```
+
+* 另外，GDT表的初始化在"kern/mm/pmm.c"中，以C语言的形式也有体现，用一个全局变量数组gdt[]来管理GDT，并使用`gdt_init`函数来初始化
+
+```C
+static struct segdesc gdt[] = {
+    SEG_NULL,
+    [SEG_KTEXT] = SEG(STA_X | STA_R, 0x0, 0xFFFFFFFF, DPL_KERNEL),
+    [SEG_KDATA] = SEG(STA_W, 0x0, 0xFFFFFFFF, DPL_KERNEL),
+    [SEG_UTEXT] = SEG(STA_X | STA_R, 0x0, 0xFFFFFFFF, DPL_USER),
+    [SEG_UDATA] = SEG(STA_W, 0x0, 0xFFFFFFFF, DPL_USER),
+    [SEG_TSS]    = SEG_NULL,
+};
+
+static void
+gdt_init(void) {
+    
+    ts.ts_esp0 = (uint32_t)&stack0 + sizeof(stack0);
+    ts.ts_ss0 = KERNEL_DS;
+
+    // initialize the TSS filed of the gdt
+    gdt[SEG_TSS] = SEG16(STS_T32A, (uint32_t)&ts, sizeof(ts), DPL_KERNEL);
+    gdt[SEG_TSS].sd_s = 0;
+
+    // reload all segment registers
+    lgdt(&gdt_pd);
+
+    // load the TSS
+    ltr(GD_TSS);
+}
+```
+
+### 练习4：分析Bootloader加载ELF格式O.S.的过程
+
+* 阅读"bootmain.c"代码，分析bootloader如何加载ELF文件
+
+#### 对bootmain.c的整体分析
+
+代码首先宏定义了`SECTSIZE`为512作为扇区大小、`ELFHDR`为虚拟地址的起始地址，语句中的`struct elfhdr`在文件"elf.h"中声明，描述了整个文件的组织。随后程序声明如下函数
+
+* `waitdisk()`，作用是**等待磁盘做好准备**
+* `readsect(void *dst, uint32_t sctno)`，作用是读取扇区secno的数据到dst位置
+* `readseg(uintptr_t va, uint32_t count, uint32_t offset)`，对readsect进行包装，可以从设备读取任意长度的内容
+* `bootmain(void)`，作为bootloader程序的入口函数
+
+#### 对具体函数的分析
+
+查看`readsect(void *dst, uint32_t secno)`函数，该函数作用为**从设备的第secno扇区读取数据到dst位置**，该函数表明了从一个扇区读取数据的流程：**1.等待磁盘做好准备；2.发出读取磁盘的命令；3.等待磁盘做好准备；4.读取磁盘数据至指定位置**。函数代码与注释说明如下
+```C
+static void
+readsect(void *dst, uint32_t secno) {
+    waitdisk();
+
+    outb(0x1F2, 1);                         // 设置读取扇区数目为1
+    outb(0x1F3, secno & 0xFF);				// 设定0-7位
+    outb(0x1F4, (secno >> 8) & 0xFF);		// 设定8-15位
+    outb(0x1F5, (secno >> 16) & 0xFF);		// 设定16-23位
+    outb(0x1F6, ((secno >> 24) & 0xF) | 0xE0);	// 设定24-31位
+    outb(0x1F7, 0x20);                      // cmd 0x20 - 读取扇区
+			/* 上面四条指令联合制定了扇区号
+	           在联合构成的32位参数中
+	           29-31位设为1
+	           28位(=0)表示访问"Disk 0"
+	           0-27位是偏移量 */
+	           
+    waitdisk();
+    
+    // 读取扇区数据到dst位置
+    insl(0x1F0, dst, SECTSIZE / 4);
+}
+```
+
+`readseg(uintptr_t va, uint32_t count, uint32_t offset)`函数对readsect函数进行简单包装，实现了读取任意长度的数据，函数代码与注释如下
+```C
+static void
+readseg(uintptr_t va, uint32_t count, uint32_t offset) {
+    uintptr_t end_va = va + count;	//计算读取块的终止地址
+
+    // 计算块的首地址（起始地址减去偏移量）
+    va -= offset % SECTSIZE;
+
+    // 从扇区1开始（扇区0已经被占用）
+    uint32_t secno = (offset / SECTSIZE) + 1;
+
+    /*读取速度过慢时，我们会同时读取多个扇区，
+      但是这会导致向内存写入的数据超出预先请求
+      此时，我们会按照升序载入数据*/
+    for (; va < end_va; va += SECTSIZE, secno ++) {
+        readsect((void *)va, secno);
+    }
+}
+```
+
+`bootmain`函数作为bootloader程序的入口，该函数表明了其加载ELF格式的O.S.的大致过程：**先等待磁盘准备就绪，然后读取ELF头部的`e_magic`判断文件是否合法，然后读取ELF内存位置的描述表，然后按照描述表内容，将ELF文件中的数据载入内存，根据ELF头部的`e_entry`代表的入口信息找到内核入口，执行内核代码。**该部分函数代码及注释如下
+
+```C
+bootmain(void) {
+    // 从磁盘的第一个扇区读取"kernel"文件
+    readseg((uintptr_t)ELFHDR, SECTSIZE * 8, 0);
+
+    // 判断是否是一个有效的ELF文件（检查e_magic）
+    if (ELFHDR->e_magic != ELF_MAGIC) {
+        goto bad;
+    }
+
+    struct proghdr *ph, *eph;
+
+    // 读取ELF头部的e_phoff变量得到描述表的头地址，指示ELF应当加载到内存的什么位置
+    ph = (struct proghdr *)((uintptr_t)ELFHDR + ELFHDR->e_phoff);
+    eph = ph + ELFHDR->e_phnum;
+    //按照描述表将ELF文件中数据按照偏移、虚拟地址、长度等信息载入内存
+    for (; ph < eph; ph ++) {
+        readseg(ph->p_va & 0xFFFFFF, ph->p_memsz, ph->p_offset);
+    }
+    /* ELF文件0x1000位置后面的0xd1ec比特被载入内存0x00100000
+	   ELF文件0xf000位置后面的0x1d20比特被载入内存0x0010e000 */
+
+    // 通过ELF头部的e_entry变量储存的入口信息，找到内核的入口地址，并开始执行内核代码
+    ((void (*)(void))(ELFHDR->e_entry & 0xFFFFFF))();
+
+bad:
+    outw(0x8A00, 0x8A00);
+    outw(0x8A00, 0x8E00);
+
+    /* do nothing */
+    while (1);
+}
+```
+
+### 练习5：实现函数调用堆栈跟踪函数
+
+* 完成位于"kern/debug/kdebug.c"中函数`print_stackframe`的实现
+
+根据"kdebug.c"中的注释指引，实现`print_stackframe`函数。首先使用`read_ebp()`和`read_eip()`获取32位的寄存器`ebp`和`eip`中的值并分别赋给32位变量`ebp_val`和`eip_val`。然后遍历栈，打印每个栈帧的信息：使用变量`arg`指向存放参数的`ss:[ebp+8]`的位置，依次打印调用函数的四个参数，输出换行符后，调用函数`print_debuginfo()`展示当前调用函数层的`eip`和`ebp`相关的信息，最后`eip`指向返回地址，`ebp`指向原`ebp`的地址。代码与注释如下
+
+```C
+void print_stackframe(void) {
+    uint32_t ebp = read_ebp();	//读取寄存器ebp数据
+	uint32_t eip = read_eip();	//读取寄存器eip数据
+	int i, j;
+    //遍历整个栈，每个栈帧信息
+	for(i = 0; i < STACKFRAME_DEPTH && ebp != 0; i++) {
+		cprintf("ebp:0x%08x eip:0x%08x", ebp, eip);
+		uint32_t *arg = (uint32_t *)ebp + 2;	//读取存放参数位置的数据
+		cprintf(" arg:");
+		for(j = 0; j < 4; j++) {
+			cprintf("0x%08x ", arg[j]);		//依次打印调用函数的四个参数
+		}
+		cprintf("\n");
+		print_debuginfo(eip - 1);
+		eip = ((uint32_t *)ebp)[1];
+		ebp = ((uint32_t*)ebp)[0];
+	}
+}
+```
+
+在Lab1目录下，在终端执行指令`make qemu`，得到相关执行结果如下图所示。与实验指导书上的参考截图对比，两者基本一致。
+![](stackFrame.jpg)
+
+打印内容的最后一行为：`ebp:0x00007bf8 eip:0x00007d6e arg:0xc031fcfa 0xc08ed88e 0x64e4d08e 0xfa7502a8  <unknow>: -- 0x00007d6d --`，下面对各参数进行分析。该行信息为调用栈中的最深一层，代表第一个使用堆栈的函数，即"bootmain"。根据函数调用关系分析，可以得知此时`ebp`的值是`kern_init`函数的栈顶地址，从"obj/bootblock.asm""文件中知可以得知，整个栈的栈顶地址为0x00007c00，`ebp`指向的栈位置存放调用者的`ebp`寄存器的值，`ebp+4`指向的栈位置存放返回地址的值，这意味着`kern_init`函数的调用者（也就是bootmain函数）没有传递任何输入参数给它。（因为存放旧的`ebp`与返回地址就需要8字节）。`eip`的值是`kern_init`函数的返回地址，也就是`bootmain`函数调用`kern_init`对应的指令的下一条指令的地址。这与"obj/bootblock.asm"是相符合的。
+
+### 练习6：完善中断初始化和处理
+
+#### Q1：中断向量表中一个表项占多少字节？其中哪几位代表中断处理代码的入口？
+
+在x86架构的计算机中，中断向量表中的每个表项占据8个字节（64位）。其中，前4个字节（32位）用于存储中断处理代码的入口地址，后4个字节（32位）用于存储中断处理代码的段选择器和控制信息。
+
+具体的，中断处理代码的入口地址存储在中断向量表的前4个字节中，也就是该中断向量表表项的低32位。在这32位中，从第0位到第15位存储着中断处理代码所在的代码段的段选择器（也称为段描述符），从第16位到第31位存储着中断处理代码的偏移量（即中断处理代码在代码段中的地址）。
+
+> 需要注意，由于中断处理程序的入口地址必须是4字节对齐的，因此中断向量表中存储的地址的最低2个比特位（第0位和第1位）总是0。
+
+#### Q2：编程完善kern/trap/trap.c中对中断向量表进行初始化的函数idt_init
+
+依据"kern/trap/trap.c"中注释指引，对函数`idt_init()`进行编写。首先声明`extern uintptr_t`类型的变量`__vectors[]`，该变量用来存放256个在vectors.S定义的中断处理例程的入口地址（"vector.S"在执行`make`指令后，在"kern/trap"目录下找到）；随后使用SETGATE宏，设置中断描述符表中的每一个表项（该宏定义在"mmu.h"中找到）；最后使用lidt函数加载中断描述符表。该部分代码及注释如下
+```C
+void idt_init(void) {
+    extern uintptr_t __vectors[];
+	int i;
+	for (i = 0; i < sizeof(idt) / sizeof(struct gatedesc); i ++) {
+        /* 使用宏SETGATE，设置中断描述符表中的每一个表项
+           参数中，宏定义GD_KTEXT代表是.text段；宏定义DPL_KERNEL代表内核级；
+           宏定义DPL_USER代表用户级；
+           宏定义T_SWITCH_TOK是用于用户态切换到内核态的中断号 */
+        SETGATE(idt[i], 0, GD_KTEXT, __vectors[i], DPL_KERNEL);		
+    }
+	SETGATE(idt[T_SWITCH_TOK], 0, GD_KTEXT, __vectors[T_SWITCH_TOK], DPL_USER);
+	lidt(&idt_pd);	//通过lidt函数加载中断描述符表
+}
+```
+
+上述函数中的SETGATE宏的声明可以在"mmu.h"中找到，如下所示。其中各个参数的含义为
+
+* 宏的参数gate代表选择的idt数组的项，是处理函数的入口地址
+* 参数istrap为1时代表系统段，为0时代表中断门
+
+* 参数sel是中断处理函数的段选择子
+* 参数off表示中断处理例程的入口地址
+* 参数dpl表示优先级。
+
+```C
+#define SETGATE(gate, istrap, sel, off, dpl) {            \
+    (gate).gd_off_15_0 = (uint32_t)(off) & 0xffff;        \
+    (gate).gd_ss = (sel);                                \
+    (gate).gd_args = 0;                                    \
+    (gate).gd_rsv1 = 0;                                    \
+    (gate).gd_type = (istrap) ? STS_TG32 : STS_IG32;    \
+    (gate).gd_s = 0;                                    \
+    (gate).gd_dpl = (dpl);                                \
+    (gate).gd_p = 1;                                    \
+    (gate).gd_off_31_16 = (uint32_t)(off) >> 16;        \
+}
+```
+
+#### Q3：编程完善trap.c中的中断处理函数trap，在对时钟中断进行处理的部分填写trap函数
+
+依据"kern/trap/trap.c"中注释指引，对函数`trap_dispatch()`进行完善。首先让用于记录时钟中断次数自增1，该变量声明位于"kern/driver/clock.c"中，且有相应函数初始化该变量为0；随后，在每轮进行`TICK_NUM`次的循环完成时，都调用一次`print_ticks()`函数。为了让`ticks`能够一直对时钟终端次数进行记录，此处通过令`ticks`与`TICK_NUM`做取模运算来判断该轮循环是否结束。`print_ticks()`函数执行打印"100 ticks"的操作。该部分代码如下
+```C
+case IRQ_OFFSET + IRQ_TIMER:
+    ticks++;
+    if (ticks % TICK_NUM == 0) {
+    	print_ticks();
+   	}
+    break;
+```
